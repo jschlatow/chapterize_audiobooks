@@ -1,0 +1,150 @@
+#!/usr/bin/tclsh
+
+if { $::argc < 4 } {
+	puts "Usage: $argv0 <build-dir> <input-chapters.txt> <output.chapters.txt> <output.list.txt>"
+	exit 1
+}
+
+set build_dir       [lindex $argv 0]
+set tmp_dir         [file join $build_dir tmp]
+set input_file      [lindex $argv 1]
+set list_output     [lindex $argv 2]
+set chapters_output [lindex $argv 3]
+
+proc chapter_name { line } {
+	set verbatim_name [lindex [split $line :] 0]
+
+	regsub "/" $verbatim_name " - " formatted_name
+
+	return $formatted_name
+}
+
+
+proc chapter_files { line } {
+	return [lindex [split $line :] 1]
+}
+
+
+proc glob_files { basedir files } {
+	set result [list]
+
+	foreach file_pattern [split $files] {
+		if [llength $file_pattern] {
+			foreach f [lsort [glob -type f [file join $basedir $file_pattern]]] {
+				lappend result $f
+			}
+		}
+	}
+
+	return $result
+}
+
+
+proc duration { filename } {
+	if [file exists $filename] {
+		set result [string trim [exec /bin/sh -c "ffmpeg -i $filename 2>&1 | grep Duration"]]
+
+		return [string trim [lindex [split $result] 1] " ,"]
+	}
+
+	return "00:00:00.000"
+}
+
+
+proc add_duration { a b } {
+	set a_list [split $a :]
+	set b_list [split $b :]
+
+	scan [lindex $a_list 2] %f asec
+	scan [lindex $b_list 2] %f bsec
+	scan [lindex $a_list 1] %d amin
+	scan [lindex $b_list 1] %d bmin
+	scan [lindex $a_list 0] %d ahrs
+	scan [lindex $b_list 0] %d bhrs
+
+	set seconds [expr $asec + $bsec]
+	set minutes [expr $amin + $bmin]
+	set hours   [expr $ahrs + $bhrs]
+
+	if [expr $seconds > 60] {
+		set seconds [expr $seconds - 60]
+		set minutes [expr $minutes + 1]
+	}
+
+	if [expr $minutes > 60] {
+		set minutes [expr $minutes - 60]
+		set hours   [expr $hours + 1]
+	}
+
+	return [format "%02d:%02d:%06.3f" $hours $minutes $seconds]
+}
+
+
+proc sum_durations { files } {
+	set result "00:00:00.000"
+	foreach f $files {
+		set result [add_duration $result [duration $f]]
+	}
+	return $result
+}
+
+
+proc relative_tmp_dir { tmp_dir } {
+	global list_output
+	set workdir [file dirname $list_output]
+
+	set dstpath [file split $tmp_dir]
+	set wrkpath [file split $workdir]
+
+	# first remove equal path elements at the beginning
+	set idx 0
+	while {$idx < [llength $dstpath] && $idx < [llength $wrkpath]} {
+		if {[lindex $dstpath $idx] != [lindex $wrkpath $idx]} { break }
+		incr idx 1
+	}
+
+	if {$idx > 0} {
+		set dstpath [lreplace $dstpath 0 $idx-1]
+		set wrkpath [lreplace $wrkpath 0 $idx-1]
+	}
+
+	# second replace elements remaining element in wrkpath by ..
+	#  and append remaining elements from dstpath
+	if {[llength $wrkpath] > 0} {
+		set wrkpath [lreplace $wrkpath 0 end ".."]
+	}
+
+	return [file join {*}[concat $wrkpath $dstpath]]
+}
+
+
+set fd          [open $input_file]
+set list_fd     [open $list_output w+]
+set chapters_fd [open $chapters_output w+]
+set total_durr  "00:00:00.000"
+set rel_tmp_dir [relative_tmp_dir $tmp_dir]
+
+foreach line [split [read $fd] "\n"] {
+	if [llength $line] {
+		# append file names to list.txt
+		set files [glob_files [file dirname $input_file] [chapter_files $line]]
+		set files_cbr [list]
+		foreach f $files {
+			set tmpfile [file join $tmp_dir "$f-cbr"]
+			if ![file exists $tmpfile] {
+				puts "Converting $f to $tmpfile"
+				catch {exec ffmpeg -i $f -f mp3 -b:a 128k -minrate:a 128k -maxrate:a 128k "$tmpfile"} dummy
+			}
+			lappend files_cbr "$tmpfile"
+			puts $list_fd "file [file join $rel_tmp_dir $f-cbr]"
+		}
+
+		puts $chapters_fd "$total_durr [chapter_name $line]"
+
+		set total_durr [add_duration $total_durr [sum_durations $files_cbr]]
+	}
+}
+
+close $fd
+close $list_fd
+close $chapters_fd
